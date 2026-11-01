@@ -93,9 +93,6 @@ func (r *metricsReceiver) scrapeV2(ctx context.Context) (pmetric.Metrics, error)
 	var errs error
 	now := pcommon.NewTimestampFromTime(time.Now())
 
-	// holds the value for number of containers in each state
-	containerStatus := make(map[string]int64)
-
 	if r.config.Config.StreamStats {
 		for _, container := range containers {
 			stats, ok := r.client.LatestContainerStats(container.ID, r.config.ControllerConfig.CollectionInterval)
@@ -111,58 +108,62 @@ func (r *metricsReceiver) scrapeV2(ctx context.Context) (pmetric.Metrics, error)
 					container.InspectResponse = updated
 				}
 			}
-			if err := r.recordContainerStats(now, stats, &container, containerStatus); err != nil {
+			if err := r.recordContainerStats(now, stats, &container); err != nil {
 				errs = multierr.Append(errs, err)
 			}
 		}
-		// We emit container status without the default resource attributes.
-		r.recordContainerStatus(now, containerStatus)
-		return r.mb.Emit(), errs
-	}
+	} else {
+		// Default (non-streaming): open a fresh connection per container each scrape.
+		results := make(chan resultV2, len(containers))
 
-	// Default (non-streaming): open a fresh connection per container each scrape.
-	results := make(chan resultV2, len(containers))
-
-	wg := &sync.WaitGroup{}
-	wg.Add(len(containers))
-	for _, container := range containers {
-		go func(c docker.Container) {
-			defer wg.Done()
-			statsJSON, err := r.client.FetchContainerStatsAsJSON(ctx, c)
-			if err != nil {
-				results <- resultV2{nil, &c, err}
-				return
-			}
-			if c.State.Health != nil {
-				if updated, ok := r.client.InspectAndPersistContainer(ctx, c.ID); ok {
-					c.InspectResponse = updated
+		wg := &sync.WaitGroup{}
+		wg.Add(len(containers))
+		for _, container := range containers {
+			go func(c docker.Container) {
+				defer wg.Done()
+				statsJSON, err := r.client.FetchContainerStatsAsJSON(ctx, c)
+				if err != nil {
+					results <- resultV2{nil, &c, err}
+					return
 				}
-			}
+				if c.State.Health != nil {
+					if updated, ok := r.client.InspectAndPersistContainer(ctx, c.ID); ok {
+						c.InspectResponse = updated
+					}
+				}
 
-			results <- resultV2{
-				stats:     statsJSON,
-				container: &c,
-				err:       nil,
+				results <- resultV2{
+					stats:     statsJSON,
+					container: &c,
+					err:       nil,
+				}
+			}(container)
+		}
+
+		wg.Wait()
+		close(results)
+
+		for res := range results {
+			if res.err != nil {
+				// Don't know the number of failed stats, but one container fetch is a partial error.
+				errs = multierr.Append(errs, scrapererror.NewPartialScrapeError(res.err, 0))
+				continue
 			}
-		}(container)
+			if err := r.recordContainerStats(now, res.stats, res.container); err != nil {
+				errs = multierr.Append(errs, err)
+			}
+		}
 	}
 
-	wg.Wait()
-	close(results)
-
-	for res := range results {
-		if res.err != nil {
-			// Don't know the number of failed stats, but one container fetch is a partial error.
-			errs = multierr.Append(errs, scrapererror.NewPartialScrapeError(res.err, 0))
-			continue
-		}
-		if err := r.recordContainerStats(now, res.stats, res.container, containerStatus); err != nil {
-			errs = multierr.Append(errs, err)
+	if r.config.MetricsBuilderConfig.Metrics.ContainerStateStatus.Enabled {
+		containerStatus, err := r.client.ContainerStateCounts(ctx)
+		if err != nil {
+			errs = multierr.Append(errs, scrapererror.NewPartialScrapeError(err, 0))
+		} else {
+			r.recordContainerStatus(now, containerStatus)
 		}
 	}
 
-	// We emit container status without the default resource attributes.
-	r.recordContainerStatus(now, containerStatus)
 	return r.mb.Emit(), errs
 }
 
@@ -170,7 +171,6 @@ func (r *metricsReceiver) recordContainerStats(
 	now pcommon.Timestamp,
 	containerStats *ctypes.StatsResponse,
 	container *docker.Container,
-	containerStatus map[string]int64,
 ) error {
 	var errs error
 	r.recordCPUMetrics(now, containerStats)
@@ -211,8 +211,6 @@ func (r *metricsReceiver) recordContainerStats(
 		}
 	}
 
-	containerStatus[string(container.State.Status)]++
-
 	r.mb.EmitForResource(metadata.WithResource(resource))
 	return errs
 }
@@ -220,7 +218,9 @@ func (r *metricsReceiver) recordContainerStats(
 // recordContainerStatus records number of containers in each state
 func (r *metricsReceiver) recordContainerStatus(now pcommon.Timestamp, containerStatus map[string]int64) {
 	for status, count := range containerStatus {
-		r.mb.RecordContainerStateStatusDataPoint(now, count, metadata.MapAttributeContainerStateStatus[status])
+		if attr, ok := metadata.MapAttributeContainerStateStatus[status]; ok {
+			r.mb.RecordContainerStateStatusDataPoint(now, count, attr)
+		}
 	}
 }
 
